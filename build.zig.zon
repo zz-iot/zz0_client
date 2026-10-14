@@ -1,0 +1,12 @@
+.{
+    .name = .zz0_client,
+    .version = "0.0.0",
+    .fingerprint = 0x41ba5bb9efb39002,
+    .minimum_zig_version = "0.15.1",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+    },
+}
