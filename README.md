@@ -2,8 +2,7 @@
 
 Reusable Zig DDS-XRCE client core for host tests and MicroZig firmware.
 
-The package is intentionally kept compatible with Zig 0.15.1 so the same core
-can be imported by MicroZig applications.
+The package requires Zig 0.17.0 for both host applications and MicroZig firmware.
 
 Current host-side smoke coverage includes a UDP `CREATE_CLIENT` ping helper
 that expects a `STATUS_AGENT` reply. Embedded transports should use the same
@@ -16,9 +15,10 @@ against the pending request/object pair.
 
 ## Build and use
 
-Run `zig build test` with Zig 0.15.1 for the protocol, session, transport, and
-host UDP tests. The transport-neutral core is also consumed by the Zig 0.16.0
-agent; `host_udp` is only exposed when compiling with Zig 0.15.x.
+Run `zig build test` with Zig 0.17.0 for the protocol, session, transport, and
+host UDP tests. The transport-neutral core is also consumed by the agent and firmware.
+`host_udp` is available on hosted targets; initialize it with a `std.Io` and
+`std.Io.net.IpAddress`. The I/O context must outlive the transport.
 
 The package exports the `zz0_client` module. With a dependency named
 `zz0_client`, add it to an application module in `build.zig`:

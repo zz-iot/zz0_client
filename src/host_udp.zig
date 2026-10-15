@@ -2,28 +2,31 @@ const std = @import("std");
 const session = @import("session.zig");
 const transport_api = @import("transport.zig");
 const xrce = @import("xrce.zig");
+const net = std.Io.net;
 
-const posix = std.posix;
-
+/// Host UDP adapter. The supplied Io must outlive the transport.
 pub const UdpTransport = struct {
-    fd: posix.socket_t,
-    agent: std.net.Address,
+    io: std.Io,
+    socket: net.Socket,
+    agent: net.IpAddress,
     max_payload: usize = 512,
 
-    pub fn init(agent: std.net.Address) !UdpTransport {
-        const fd = try posix.socket(agent.any.family, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, posix.IPPROTO.UDP);
-        return .{ .fd = fd, .agent = agent };
+    pub fn init(io: std.Io, agent: net.IpAddress) !UdpTransport {
+        const local: net.IpAddress = switch (agent) {
+            .ip4 => .{ .ip4 = .unspecified(0) },
+            .ip6 => return error.UnsupportedAddressFamily,
+        };
+        return bind(io, local, agent);
     }
 
-    pub fn bind(local: std.net.Address, agent: std.net.Address) !UdpTransport {
-        const fd = try posix.socket(local.any.family, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, posix.IPPROTO.UDP);
-        errdefer posix.close(fd);
-        try posix.bind(fd, &local.any, local.getOsSockLen());
-        return .{ .fd = fd, .agent = agent };
+    pub fn bind(io: std.Io, local: net.IpAddress, agent: net.IpAddress) !UdpTransport {
+        if (local != .ip4 or agent != .ip4) return error.UnsupportedAddressFamily;
+        const socket = try local.bind(io, .{ .mode = .dgram, .protocol = .udp });
+        return .{ .io = io, .socket = socket, .agent = agent };
     }
 
     pub fn deinit(self: *UdpTransport) void {
-        posix.close(self.fd);
+        self.socket.close(self.io);
         self.* = undefined;
     }
 
@@ -40,13 +43,17 @@ pub const UdpTransport = struct {
 
     pub fn sendBytes(self: *UdpTransport, bytes: []const u8, endpoint: transport_api.Endpoint) !void {
         const dest = try endpointToAddress(endpoint, self.agent);
-        const sent = try posix.sendto(self.fd, bytes, 0, &dest.any, dest.getOsSockLen());
-        if (sent != bytes.len) return error.ShortDatagramSend;
+        try self.socket.send(self.io, &dest, bytes);
     }
 
+    /// A negative timeout waits indefinitely; zero polls without blocking.
     pub fn recvMessage(self: *UdpTransport, buffer: []u8, timeout_ms: i32) !transport_api.ReceivedMessage {
-        try waitReadable(self.fd, timeout_ms);
-        return try self.recvBlocking(buffer);
+        const timeout: std.Io.Timeout = if (timeout_ms < 0) .none else .{ .duration = .{
+            .clock = .awake,
+            .raw = std.Io.Duration.fromMilliseconds(timeout_ms),
+        } };
+        const incoming = try self.socket.receiveTimeout(self.io, buffer, timeout);
+        return .{ .bytes = incoming.data, .source = try addressToEndpoint(incoming.from) };
     }
 
     pub fn createClientPing(
@@ -81,17 +88,6 @@ pub const UdpTransport = struct {
         };
     }
 
-    fn recvBlocking(self: *UdpTransport, buffer: []u8) !transport_api.ReceivedMessage {
-        var storage: posix.sockaddr.storage = undefined;
-        var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-        const addr: *posix.sockaddr = @ptrCast(&storage);
-        const n = try posix.recvfrom(self.fd, buffer, 0, addr, &addr_len);
-
-        const source_addr: *align(4) const posix.sockaddr = @ptrCast(&storage);
-        const source = try addressToEndpoint(std.net.Address.initPosix(source_addr));
-        return .{ .bytes = buffer[0..n], .source = source };
-    }
-
     fn maxPayload(ctx: *anyopaque) usize {
         const self: *UdpTransport = @ptrCast(@alignCast(ctx));
         return self.max_payload;
@@ -104,111 +100,89 @@ pub const UdpTransport = struct {
 
     fn recvVtable(ctx: *anyopaque, buffer: []u8) !?transport_api.ReceivedMessage {
         const self: *UdpTransport = @ptrCast(@alignCast(ctx));
-        if (!try isReadable(self.fd, 0)) return null;
-        return try self.recvBlocking(buffer);
+        return self.recvMessage(buffer, 0) catch |err| switch (err) {
+            error.Timeout => null,
+            else => return err,
+        };
     }
 };
 
-fn endpointToAddress(endpoint: transport_api.Endpoint, default: std.net.Address) !std.net.Address {
+fn endpointToAddress(endpoint: transport_api.Endpoint, default: net.IpAddress) !net.IpAddress {
     return switch (endpoint) {
         .none => default,
-        .udp4 => |udp4| std.net.Address.initIp4(udp4.address, udp4.port),
+        .udp4 => |udp4| .{ .ip4 = .{ .bytes = udp4.address, .port = udp4.port } },
         .serial => error.UnsupportedEndpoint,
     };
 }
 
-fn addressToEndpoint(address: std.net.Address) !transport_api.Endpoint {
-    if (address.any.family != posix.AF.INET) return error.UnsupportedAddressFamily;
-    const bytes: *const [4]u8 = @ptrCast(&address.in.sa.addr);
-    return .{ .udp4 = .{ .address = bytes.*, .port = address.getPort() } };
-}
-
-fn waitReadable(fd: posix.socket_t, timeout_ms: i32) !void {
-    if (!try isReadable(fd, timeout_ms)) return error.Timeout;
-}
-
-fn isReadable(fd: posix.socket_t, timeout_ms: i32) !bool {
-    var fds = [_]posix.pollfd{.{
-        .fd = fd,
-        .events = posix.POLL.IN,
-        .revents = 0,
-    }};
-    const ready = try posix.poll(&fds, timeout_ms);
-    return ready != 0 and (fds[0].revents & posix.POLL.IN) != 0;
+fn addressToEndpoint(address: net.IpAddress) !transport_api.Endpoint {
+    return switch (address) {
+        .ip4 => |ip4| .{ .udp4 = .{ .address = ip4.bytes, .port = ip4.port } },
+        .ip6 => error.UnsupportedAddressFamily,
+    };
 }
 
 test "host UDP transport exchanges CREATE_CLIENT and STATUS_AGENT" {
+    const io = std.testing.io;
+    const local: net.IpAddress = .{ .ip4 = .loopback(0) };
+    const socket = try local.bind(io, .{ .mode = .dgram, .protocol = .udp });
+    defer socket.close(io);
+
     const TestAgent = struct {
-        fd: posix.socket_t,
-        address: std.net.Address,
+        socket: net.Socket,
         result: anyerror!void = {},
-
-        fn init() !@This() {
-            const bind_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
-            const fd = try posix.socket(bind_addr.any.family, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, posix.IPPROTO.UDP);
-            errdefer posix.close(fd);
-            try posix.bind(fd, &bind_addr.any, bind_addr.getOsSockLen());
-
-            var storage: posix.sockaddr.storage = undefined;
-            var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-            const addr: *posix.sockaddr = @ptrCast(&storage);
-            try posix.getsockname(fd, addr, &addr_len);
-
-            const local_addr: *align(4) const posix.sockaddr = @ptrCast(&storage);
-            return .{
-                .fd = fd,
-                .address = std.net.Address.initPosix(local_addr),
-            };
-        }
-
-        fn deinit(self: *@This()) void {
-            posix.close(self.fd);
-            self.* = undefined;
-        }
 
         fn run(self: *@This()) void {
             self.result = self.runFallible();
         }
 
         fn runFallible(self: *@This()) !void {
-            try waitReadable(self.fd, 1000);
-
             var request: [xrce.CreateClient.message_len + 32]u8 = undefined;
-            var source: posix.sockaddr.storage = undefined;
-            var source_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-            const source_addr: *posix.sockaddr = @ptrCast(&source);
-            const request_len = try posix.recvfrom(self.fd, &request, 0, source_addr, &source_len);
-            const create = try xrce.decodeCreateClientMessage(request[0..request_len]);
-
+            const incoming = try self.socket.receiveTimeout(std.testing.io, &request, .{ .duration = .{
+                .clock = .awake,
+                .raw = std.Io.Duration.fromMilliseconds(1000),
+            } });
+            const create = try xrce.decodeCreateClientMessage(incoming.data);
             var response: [xrce.StatusAgent.message_len]u8 = undefined;
             const response_len = try (xrce.StatusAgent{
                 .session_id = create.session_id,
                 .sequence_nr = create.header.sequence_nr,
             }).encodeMessage(&response);
-
-            const sent = try posix.sendto(self.fd, response[0..response_len], 0, source_addr, source_len);
-            if (sent != response_len) return error.ShortDatagramSend;
+            try self.socket.send(std.testing.io, &incoming.from, response[0..response_len]);
         }
     };
+    var agent = TestAgent{ .socket = socket };
+    const agent_thread = try std.Thread.spawn(.{}, TestAgent.run, .{&agent});
+    defer agent_thread.join();
 
-    var agent = try TestAgent.init();
-    defer agent.deinit();
-
-    var agent_thread = try std.Thread.spawn(.{}, TestAgent.run, .{&agent});
-
-    var client = try UdpTransport.init(agent.address);
+    var client = try UdpTransport.init(io, socket.address);
     defer client.deinit();
-
     const status = try client.createClientPing(.{
         .client_key = .{ 0x11, 0x22, 0x33, 0x44 },
         .session_id = 0x81,
         .sequence_nr = 9,
     }, 1000);
 
-    agent_thread.join();
-    try agent.result;
-
     try std.testing.expectEqual(@as(u8, 0x81), status.header.session_id);
     try std.testing.expectEqual(@as(u16, 9), status.header.sequence_nr);
     try std.testing.expectEqualSlices(u8, &xrce.vendor_id_zenzen, &status.vendor_id);
+}
+
+test "host UDP transport polls and receives from an explicit endpoint" {
+    const io = std.testing.io;
+    const local: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var sender = try UdpTransport.bind(io, local, local);
+    defer sender.deinit();
+    var receiver = try UdpTransport.bind(io, local, sender.socket.address);
+    defer receiver.deinit();
+    var buffer: [32]u8 = undefined;
+    try std.testing.expectEqual(null, try receiver.transport().recv(&buffer));
+    try std.testing.expectError(error.Timeout, receiver.recvMessage(&buffer, 1));
+
+    const destination = try addressToEndpoint(receiver.socket.address);
+    try sender.transport().send("hello", destination);
+    const message = try receiver.transport().recv(&buffer) orelse return error.ExpectedDatagram;
+    try std.testing.expectEqualStrings("hello", message.bytes);
+    try std.testing.expectEqualDeep(try addressToEndpoint(sender.socket.address), message.source);
+    try std.testing.expectError(error.UnsupportedEndpoint, sender.sendBytes("x", .{ .serial = .{ .source = 1, .remote = 2 } }));
 }
