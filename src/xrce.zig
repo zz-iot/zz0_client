@@ -127,7 +127,7 @@ pub const SubmessageHeader = struct {
 
     pub fn encode(self: SubmessageHeader, out: []u8) !void {
         if (out.len < encoded_len) return error.BufferTooSmall;
-        out[0] = @intFromEnum(self.id);
+        out[0] = @backingInt(self.id);
         out[1] = self.flags;
         writeU16Le(out[2..4], self.length);
     }
@@ -257,8 +257,8 @@ pub const CreateByReference = struct {
         var writer = PayloadWriter.init(out);
         try writer.writeBytes(&self.request_id);
         try writer.writeBytes(&self.object_prefix);
-        try writer.writeU8(@intFromEnum(self.object_kind));
-        try writer.writeU8(@intFromEnum(RepresentationFormat.by_reference));
+        try writer.writeU8(@backingInt(self.object_kind));
+        try writer.writeU8(@backingInt(RepresentationFormat.by_reference));
         try writer.writeString(self.reference);
 
         switch (self.object_kind) {
@@ -461,7 +461,7 @@ pub const Status = struct {
 
         @memcpy(out[8..10], &self.request.request_id);
         @memcpy(out[10..12], &self.request.object_id);
-        out[12] = @intFromEnum(self.result.status);
+        out[12] = @backingInt(self.result.status);
         out[13] = self.result.implementation_status;
         return message_len;
     }
@@ -593,7 +593,7 @@ pub fn requestIdFromInt(value: u16) RequestId {
 }
 
 pub fn objectIdFromPrefix(prefix: ObjectIdPrefix, kind: ObjectKind) ObjectId {
-    return .{ prefix[0], (prefix[1] & 0xf0) | (@intFromEnum(kind) & 0x0f) };
+    return .{ prefix[0], (prefix[1] & 0xf0) | (@backingInt(kind) & 0x0f) };
 }
 
 fn objectKindFromByte(value: u8) ?ObjectKind {
@@ -853,7 +853,7 @@ test "create client encode/decode" {
 
     try std.testing.expectEqual(@as(usize, CreateClient.message_len), n);
     try std.testing.expectEqualSlices(u8, &.{ 0x80, 0x00, 0x00, 0x00 }, buf[0..4]);
-    try std.testing.expectEqual(@intFromEnum(SubmessageId.create_client), buf[4]);
+    try std.testing.expectEqual(@backingInt(SubmessageId.create_client), buf[4]);
     try std.testing.expectEqual(flag_little_endian | flag_create_reuse | flag_create_replace, buf[5]);
     try std.testing.expectEqual(@as(u16, CreateClient.payload_len), readU16Le(buf[6..8]));
 
@@ -875,7 +875,7 @@ test "create by reference encodes and decodes application" {
     }).encodeMessage(&buf);
 
     try std.testing.expectEqual(@as(u8, 0x81), buf[0]);
-    try std.testing.expectEqual(@intFromEnum(SubmessageId.create), buf[4]);
+    try std.testing.expectEqual(@backingInt(SubmessageId.create), buf[4]);
     try std.testing.expectEqual(flag_little_endian | flag_create_reuse | flag_create_replace, buf[5]);
 
     const got = try decodeCreateMessage(buf[0..n]);
@@ -934,7 +934,7 @@ test "write data encode/decode" {
         .serialized_data = &.{ 0x00, 0x01, 0x02, 0x03 },
     }).encodeMessage(&buf);
 
-    try std.testing.expectEqual(@intFromEnum(SubmessageId.write_data), buf[4]);
+    try std.testing.expectEqual(@backingInt(SubmessageId.write_data), buf[4]);
     try std.testing.expectEqual(flag_little_endian, buf[5]);
 
     const got = try decodeWriteDataMessage(buf[0..n]);
@@ -957,7 +957,7 @@ test "status encode/decode" {
     }).encodeMessage(&buf);
 
     try std.testing.expectEqual(@as(usize, Status.message_len), n);
-    try std.testing.expectEqual(@intFromEnum(SubmessageId.status), buf[4]);
+    try std.testing.expectEqual(@backingInt(SubmessageId.status), buf[4]);
 
     const got = try decodeStatusMessage(&buf);
     try std.testing.expectEqual(@as(u8, 0x81), got.header.session_id);
@@ -972,7 +972,7 @@ test "status agent encode/decode" {
     const n = try (StatusAgent{ .session_id = 0xdd, .sequence_nr = 1 }).encodeMessage(&buf);
 
     try std.testing.expectEqual(@as(usize, StatusAgent.message_len), n);
-    try std.testing.expectEqual(@intFromEnum(SubmessageId.status_agent), buf[4]);
+    try std.testing.expectEqual(@backingInt(SubmessageId.status_agent), buf[4]);
 
     const got = try decodeStatusAgentMessage(&buf);
     try std.testing.expectEqual(@as(u8, 0xdd), got.header.session_id);
