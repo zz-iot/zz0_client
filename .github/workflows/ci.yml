@@ -1,0 +1,49 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '15 5 * * 1'
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: '0.17.0'
+      - run: zig fmt --check build.zig src interop/client.zig
+      - run: zig build test
+      - run: zig build test -Doptimize=ReleaseSafe
+  independent-interop:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: '0.17.0'
+      - name: Install independent peer build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libfoonathan-memory-dev libssl-dev
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/xrce-peers
+          key: xrce-client-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('interop/build_peers.py') }}
+      - name: Build pinned independent peers
+        run: python3 interop/build_peers.py --work "$RUNNER_TEMP/xrce-peers" --agent
+      - run: zig build interop-client -Doptimize=ReleaseSafe
+      - name: Verify independent sample receipt
+        run: python3 interop/run.py --client zig-out/bin/zz0_interop_client --prefix "$RUNNER_TEMP/xrce-peers/install" --logs "$RUNNER_TEMP/interop-logs"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: independent-interop-logs
+          path: ${{ runner.temp }}/interop-logs

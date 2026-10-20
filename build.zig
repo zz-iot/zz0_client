@@ -10,6 +10,18 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const interop = b.addExecutable(.{
+        .name = "zz0_interop_client",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("interop/client.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zz0_client", .module = mod }},
+        }),
+    });
+    const install_interop = b.addInstallArtifact(interop, .{});
+    b.step("interop-client", "Build the independent-agent test client").dependOn(&install_interop.step);
+
     const tests = b.addTest(.{
         .root_module = mod,
     });

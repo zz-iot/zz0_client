@@ -1,0 +1,16 @@
+<profiles>
+  <participant profile_name="MyLibrary::CounterParticipant">
+    <rtps><name>zz0_interop</name><useBuiltinTransports>true</useBuiltinTransports></rtps>
+  </participant>
+  <topic profile_name="MyLibrary::CounterStatusTopic">
+    <kind>NO_KEY</kind><name>zz0_interop_counter</name><dataType>CounterStatus</dataType>
+  </topic>
+  <data_writer profile_name="MyLibrary::CounterStatusWriter">
+    <topic><kind>NO_KEY</kind><name>zz0_interop_counter</name><dataType>CounterStatus</dataType></topic>
+    <qos><reliability><kind>BEST_EFFORT</kind></reliability></qos>
+  </data_writer>
+  <data_reader profile_name="CounterReader">
+    <topic><kind>NO_KEY</kind><name>zz0_interop_counter</name><dataType>CounterStatus</dataType></topic>
+    <qos><reliability><kind>BEST_EFFORT</kind></reliability></qos>
+  </data_reader>
+</profiles>

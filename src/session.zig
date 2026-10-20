@@ -6,6 +6,8 @@ pub const ClientSession = struct {
     client_key: [4]u8,
     session_id: u8,
     vendor_id: [2]u8 = xrce.vendor_id_zenzen,
+    handshake_encoding: xrce.HandshakeEncoding = .omg_1_0,
+    output_stream_id: u8 = xrce.stream_id_builtin_best_effort,
     next_sequence_nr: u16 = 0,
     next_request_id: u16 = 1,
     state: State = .disconnected,
@@ -16,6 +18,8 @@ pub const ClientSession = struct {
         client_key: [4]u8,
         session_id: u8,
         vendor_id: [2]u8 = xrce.vendor_id_zenzen,
+        handshake_encoding: xrce.HandshakeEncoding = .omg_1_0,
+        output_stream_id: u8 = xrce.stream_id_builtin_best_effort,
         initial_sequence_nr: u16 = 0,
         initial_request_id: u16 = 1,
     };
@@ -37,6 +41,8 @@ pub const ClientSession = struct {
             .client_key = options.client_key,
             .session_id = options.session_id,
             .vendor_id = options.vendor_id,
+            .handshake_encoding = options.handshake_encoding,
+            .output_stream_id = options.output_stream_id,
             .next_sequence_nr = options.initial_sequence_nr,
             .next_request_id = options.initial_request_id,
         };
@@ -48,6 +54,7 @@ pub const ClientSession = struct {
             .client_key = self.client_key,
             .session_id = self.session_id,
             .vendor_id = self.vendor_id,
+            .handshake_encoding = self.handshake_encoding,
             .sequence_nr = sequence_nr,
         }).encodeMessage(out);
         self.pending_create_sequence_nr = sequence_nr;
@@ -69,6 +76,7 @@ pub const ClientSession = struct {
         object_prefix: xrce.ObjectIdPrefix,
         object_kind: xrce.ObjectKind,
         reference: []const u8,
+        representation_format: xrce.RepresentationFormat = .by_reference,
         reuse: bool = true,
         replace: bool = true,
         participant_domain_id: i16 = 0,
@@ -85,10 +93,12 @@ pub const ClientSession = struct {
         const create = xrce.CreateByReference{
             .session_id = self.session_id,
             .sequence_nr = sequence_nr,
+            .stream_id = self.output_stream_id,
             .request_id = request_id,
             .object_prefix = options.object_prefix,
             .object_kind = options.object_kind,
             .reference = options.reference,
+            .representation_format = options.representation_format,
             .reuse = options.reuse,
             .replace = options.replace,
             .participant_domain_id = options.participant_domain_id,
@@ -129,6 +139,7 @@ pub const ClientSession = struct {
             .session_id = self.session_id,
             .sequence_nr = sequence_nr,
             .request_id = request_id,
+            .stream_id = self.output_stream_id,
             .object_id = options.object_id,
             .serialized_data = options.serialized_data,
         }).encodeMessage(out);
@@ -166,7 +177,7 @@ pub const ClientSession = struct {
         while (try iterator.next()) |submessage| {
             switch (submessage.header.id) {
                 .status_agent => {
-                    const status = try xrce.decodeStatusAgent(message.header, submessage);
+                    const status = try xrce.decodeStatusAgentWithEncoding(message.header, submessage, self.handshake_encoding);
                     try self.acceptStatusAgent(status);
                     return .{ .status_agent = status };
                 },
@@ -184,8 +195,8 @@ pub const ClientSession = struct {
 
     fn acceptStatusAgent(self: *ClientSession, status: xrce.DecodedStatusAgent) !void {
         if (status.header.session_id != self.session_id) return error.UnexpectedSessionId;
-        if (self.pending_create_sequence_nr) |sequence_nr| {
-            if (status.header.sequence_nr != sequence_nr) return error.UnexpectedSequenceNr;
+        if (status.result) |result| {
+            if (result.status != .ok) return error.SessionRejected;
         }
         self.pending_create_sequence_nr = null;
         self.state = .connected;
@@ -404,4 +415,25 @@ test "client session writes data and accepts STATUS" {
         else => return error.ExpectedStatus,
     }
     try std.testing.expectEqual(@as(?xrce.BaseObjectRequest, null), client.pending_request);
+}
+
+test "independent agent login result determines acceptance, not its stream sequence" {
+    const fixture = @embedFile("fixtures/eprosima-status-agent.bin");
+    var client = ClientSession.init(.{
+        .client_key = .{ 1, 2, 3, 4 },
+        .session_id = 0x81,
+        .initial_sequence_nr = 5,
+        .handshake_encoding = .eprosima_v3,
+    });
+    var request: [xrce.CreateClient.max_message_len]u8 = undefined;
+    _ = try client.encodeCreateClient(&request);
+    _ = try client.handleDatagram(fixture); // Independent agent's stream-NONE sequence is zero.
+    try std.testing.expectEqual(ClientSession.State.connected, client.state);
+
+    client = ClientSession.init(.{ .client_key = .{ 1, 2, 3, 4 }, .session_id = 0x81, .handshake_encoding = .eprosima_v3 });
+    _ = try client.encodeCreateClient(&request);
+    var denied: [fixture.len]u8 = fixture.*;
+    denied[8] = @backingInt(xrce.StatusValue.err_denied);
+    try std.testing.expectError(error.SessionRejected, client.handleDatagram(&denied));
+    try std.testing.expectEqual(ClientSession.State.create_client_sent, client.state);
 }

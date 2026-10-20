@@ -65,6 +65,7 @@ pub const UdpTransport = struct {
             .client_key = request.client_key,
             .session_id = request.session_id,
             .vendor_id = request.vendor_id,
+            .handshake_encoding = request.handshake_encoding,
             .initial_sequence_nr = request.sequence_nr,
         });
         return try self.openSession(&client_session, timeout_ms);
@@ -75,11 +76,11 @@ pub const UdpTransport = struct {
         client_session: *session.ClientSession,
         timeout_ms: i32,
     ) !xrce.DecodedStatusAgent {
-        var outbound: [xrce.CreateClient.message_len]u8 = undefined;
+        var outbound: [xrce.CreateClient.max_message_len]u8 = undefined;
         const outbound_bytes = try client_session.encodeCreateClient(&outbound);
         try self.sendBytes(outbound_bytes, .none);
 
-        var inbound: [xrce.StatusAgent.message_len + 32]u8 = undefined;
+        var inbound: [xrce.StatusAgent.max_message_len + 32]u8 = undefined;
         const message = try self.recvMessage(&inbound, timeout_ms);
         const event = try client_session.handleDatagram(message.bytes);
         return switch (event) {

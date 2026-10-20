@@ -34,3 +34,14 @@ Application code can then use `@import("zz0_client")`.
 
 See [ROADMAP.md](ROADMAP.md) for current scope, interoperability goals and the
 planned path toward DDS bridging, reliable sessions and subscriptions.
+
+## Independent interoperability
+
+See [interop/README.md](interop/README.md) for the pinned eProsima peer test,
+local commands, CI workflow and exact scope of the verified subset.
+
+Login encoding defaults to the published OMG 1.0 IDL. An explicit
+`HandshakeEncoding.eprosima_v3` option enables the pinned peer's extra login
+fields. See [the spec audit](interop/spec-audit.md) for the distinction between
+encoding fixes and compatibility conventions. Default request streams are
+best-effort (0x01); reliable streams remain unimplemented.

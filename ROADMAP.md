@@ -18,6 +18,12 @@ of XRCE reliable streams. The current scope is publishing, not subscriptions.
 
 ## 1. Establish interoperability and scope
 
+The pinned eProsima agent/observer test and independently captured wire fixtures
+now cover the limited publishing subset documented in `interop/README.md`. CI
+configuration is included; remote CI execution is not yet evidence. The normative review and remaining compliance
+gaps are recorded in `interop/spec-audit.md`; eProsima-specific login encoding
+is opt-in. Remaining:
+
 - Maintain a support matrix against the OMG DDS-XRCE specification, documenting
   supported messages, representations, session/stream behavior and limits.
 - Exercise this client against an independent agent, starting with session

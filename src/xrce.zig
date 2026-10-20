@@ -4,6 +4,10 @@ pub const xrce_cookie: [4]u8 = .{ 'X', 'R', 'C', 'E' };
 pub const xrce_version: [2]u8 = .{ 0x01, 0x00 };
 pub const vendor_id_zenzen: [2]u8 = .{ 0x5a, 0x5a };
 
+/// Published DDS-XRCE 1.0 IDL is the default. eProsima v3 has two
+/// incompatible login fields; select that encoding explicitly, never by sniffing.
+pub const HandshakeEncoding = enum { omg_1_0, eprosima_v3 };
+
 pub const session_id_none_without_client_key: u8 = 0x80;
 pub const stream_id_none: u8 = 0x00;
 pub const stream_id_builtin_best_effort: u8 = 0x01;
@@ -171,15 +175,20 @@ pub const SubmessageIterator = struct {
 
 pub const CreateClient = struct {
     pub const payload_len = 14;
+    pub const max_message_len = MessageHeader.encoded_len + SubmessageHeader.encoded_len + payload_len + 2;
     pub const message_len = MessageHeader.encoded_len + SubmessageHeader.encoded_len + payload_len;
 
     client_key: [4]u8,
     session_id: u8,
+    /// Used only by the explicitly selected eProsima encoding.
+    mtu: u16 = 512,
+    handshake_encoding: HandshakeEncoding = .omg_1_0,
     vendor_id: [2]u8 = vendor_id_zenzen,
     sequence_nr: u16 = 0,
 
     pub fn encodeMessage(self: CreateClient, out: []u8) !usize {
-        if (out.len < message_len) return error.BufferTooSmall;
+        const wire_len = message_len + @as(usize, if (self.handshake_encoding == .eprosima_v3) 2 else 0);
+        if (out.len < wire_len) return error.BufferTooSmall;
 
         try (MessageHeader{
             .session_id = session_id_none_without_client_key,
@@ -189,8 +198,8 @@ pub const CreateClient = struct {
 
         try (SubmessageHeader{
             .id = .create_client,
-            .flags = flag_little_endian | flag_create_reuse | flag_create_replace,
-            .length = payload_len,
+            .flags = flag_little_endian,
+            .length = @intCast(wire_len - 8),
         }).encode(out[4..8]);
 
         @memcpy(out[8..12], &xrce_cookie);
@@ -199,7 +208,8 @@ pub const CreateClient = struct {
         @memcpy(out[16..20], &self.client_key);
         out[20] = self.session_id;
         out[21] = 0; // optional properties absent
-        return message_len;
+        if (self.handshake_encoding == .eprosima_v3) writeU16Le(out[22..24], self.mtu);
+        return wire_len;
     }
 };
 
@@ -210,12 +220,14 @@ pub const BaseObjectRequest = struct {
 
 pub const CreateByReference = struct {
     session_id: u8,
-    stream_id: u8 = stream_id_builtin_reliable,
+    stream_id: u8 = stream_id_builtin_best_effort,
     sequence_nr: u16,
     request_id: RequestId,
     object_prefix: ObjectIdPrefix,
     object_kind: ObjectKind,
     reference: []const u8,
+    /// Only the empty-XML publisher compatibility convention is supported.
+    representation_format: RepresentationFormat = .by_reference,
     reuse: bool = true,
     replace: bool = true,
     participant_domain_id: i16 = 0,
@@ -227,6 +239,9 @@ pub const CreateByReference = struct {
         if (out.len < MessageHeader.encoded_len + SubmessageHeader.encoded_len) return error.BufferTooSmall;
         if (self.reference.len > 128) return error.ReferenceTooLong;
         if (!objectKindSupportsReference(self.object_kind)) return error.UnsupportedObjectKind;
+        if (self.representation_format != .by_reference and
+            !(self.object_kind == .publisher and self.representation_format == .as_xml_string and self.reference.len == 0))
+            return error.UnsupportedRepresentationFormat;
 
         const payload_len = try self.encodePayload(out[MessageHeader.encoded_len + SubmessageHeader.encoded_len ..]);
         const message_len = MessageHeader.encoded_len + SubmessageHeader.encoded_len + payload_len;
@@ -256,9 +271,10 @@ pub const CreateByReference = struct {
     fn encodePayload(self: CreateByReference, out: []u8) !usize {
         var writer = PayloadWriter.init(out);
         try writer.writeBytes(&self.request_id);
-        try writer.writeBytes(&self.object_prefix);
+        const object_id = self.objectId();
+        try writer.writeBytes(&object_id);
         try writer.writeU8(@backingInt(self.object_kind));
-        try writer.writeU8(@backingInt(RepresentationFormat.by_reference));
+        try writer.writeU8(@backingInt(self.representation_format));
         try writer.writeString(self.reference);
 
         switch (self.object_kind) {
@@ -276,6 +292,8 @@ pub const CreateByReference = struct {
 };
 
 pub const DecodedCreate = struct {
+    /// Preserve the request bytes for reply correlation; CREATE also permits a prefix.
+    request_object_id: ObjectId,
     header: MessageHeader,
     submessage: SubmessageHeader,
     request_id: RequestId,
@@ -295,13 +313,15 @@ pub fn decodeCreate(header: MessageHeader, submessage: Submessage) !DecodedCreat
 
     var reader = PayloadReader.init(submessage.payload);
     const request_id = try reader.readBytes(2);
-    const object_prefix = try reader.readBytes(2);
+    const wire_object_id = (try reader.readBytes(2)).*;
+    const object_prefix: ObjectIdPrefix = .{ wire_object_id[0], wire_object_id[1] & 0xf0 };
     const object_kind = objectKindFromByte(try reader.readU8()) orelse return error.UnknownObjectKind;
     const representation_format = representationFormatFromByte(try reader.readU8()) orelse return error.UnknownRepresentationFormat;
-    if (representation_format != .by_reference) return error.UnsupportedRepresentationFormat;
+    if (representation_format != .by_reference and !(object_kind == .publisher and representation_format == .as_xml_string)) return error.UnsupportedRepresentationFormat;
     if (!objectKindSupportsReference(object_kind)) return error.UnsupportedObjectKind;
 
     const reference = try reader.readString();
+    if (representation_format == .as_xml_string and reference.len != 0) return error.UnsupportedRepresentationFormat;
     var participant_domain_id: ?i16 = null;
     var related_object_id: ?ObjectId = null;
 
@@ -318,8 +338,9 @@ pub fn decodeCreate(header: MessageHeader, submessage: Submessage) !DecodedCreat
         .header = header,
         .submessage = sh,
         .request_id = request_id.*,
-        .object_prefix = object_prefix.*,
-        .object_id = objectIdFromPrefix(object_prefix.*, object_kind),
+        .object_prefix = object_prefix,
+        .request_object_id = wire_object_id,
+        .object_id = objectIdFromPrefix(object_prefix, object_kind),
         .object_kind = object_kind,
         .representation_format = representation_format,
         .reference = reference,
@@ -341,16 +362,22 @@ pub const DecodedCreateClient = struct {
     client_key: [4]u8,
     session_id: u8,
     vendor_id: [2]u8,
+    mtu: ?u16 = null,
 };
 
 pub fn decodeCreateClient(header: MessageHeader, submessage: Submessage) !DecodedCreateClient {
+    return decodeCreateClientWithEncoding(header, submessage, .omg_1_0);
+}
+
+pub fn decodeCreateClientWithEncoding(header: MessageHeader, submessage: Submessage, encoding: HandshakeEncoding) !DecodedCreateClient {
     const sh = submessage.header;
     if (sh.id != .create_client) return error.UnexpectedSubmessage;
-    if (sh.length != CreateClient.payload_len) return error.InvalidSubmessageLength;
+    const expected_len: usize = CreateClient.payload_len + @as(usize, if (encoding == .eprosima_v3) 2 else 0);
+    if (sh.length != expected_len) return error.InvalidSubmessageLength;
     if ((sh.flags & flag_little_endian) == 0) return error.UnsupportedEndian;
 
     const payload = submessage.payload;
-    if (payload.len < CreateClient.payload_len) return error.ShortSubmessage;
+    if (payload.len < expected_len) return error.ShortSubmessage;
     if (!std.mem.eql(u8, payload[0..4], &xrce_cookie)) return error.InvalidXrceCookie;
     if (!std.mem.eql(u8, payload[4..6], &xrce_version)) return error.UnsupportedXrceVersion;
     if (payload[13] != 0) return error.PropertiesNotSupported;
@@ -361,19 +388,24 @@ pub fn decodeCreateClient(header: MessageHeader, submessage: Submessage) !Decode
         .client_key = payload[8..12].*,
         .session_id = payload[12],
         .vendor_id = payload[6..8].*,
+        .mtu = if (encoding == .eprosima_v3) readU16Le(payload[14..16]) else null,
     };
 }
 
 pub fn decodeCreateClientMessage(bytes: []const u8) !DecodedCreateClient {
+    return decodeCreateClientMessageWithEncoding(bytes, .omg_1_0);
+}
+
+pub fn decodeCreateClientMessageWithEncoding(bytes: []const u8, encoding: HandshakeEncoding) !DecodedCreateClient {
     const message = try decodeMessage(bytes);
     var iterator = message.submessages();
     const submessage = (try iterator.next()) orelse return error.ShortSubmessage;
-    return decodeCreateClient(message.header, submessage);
+    return decodeCreateClientWithEncoding(message.header, submessage, encoding);
 }
 
 pub const WriteData = struct {
     session_id: u8,
-    stream_id: u8 = stream_id_builtin_reliable,
+    stream_id: u8 = stream_id_builtin_best_effort,
     sequence_nr: u16,
     request_id: RequestId,
     object_id: ObjectId,
@@ -439,7 +471,7 @@ pub const Status = struct {
     pub const message_len = MessageHeader.encoded_len + SubmessageHeader.encoded_len + payload_len;
 
     session_id: u8,
-    stream_id: u8 = stream_id_builtin_reliable,
+    stream_id: u8 = stream_id_builtin_best_effort,
     sequence_nr: u16,
     request: BaseObjectRequest,
     result: ResultStatus = .{},
@@ -505,14 +537,20 @@ pub fn decodeStatusMessage(bytes: []const u8) !DecodedStatus {
 
 pub const StatusAgent = struct {
     pub const payload_len = 9;
+    pub const max_message_len = MessageHeader.encoded_len + SubmessageHeader.encoded_len + payload_len + 2;
     pub const message_len = MessageHeader.encoded_len + SubmessageHeader.encoded_len + payload_len;
 
     session_id: u8,
     sequence_nr: u16 = 0,
     vendor_id: [2]u8 = vendor_id_zenzen,
+    result: ResultStatus = .{},
+    handshake_encoding: HandshakeEncoding = .omg_1_0,
 
     pub fn encodeMessage(self: StatusAgent, out: []u8) !usize {
-        if (out.len < message_len) return error.BufferTooSmall;
+        const result_len: usize = if (self.handshake_encoding == .eprosima_v3) 2 else 0;
+        const wire_len = message_len + result_len;
+        if (result_len == 0 and (self.result.status != .ok or self.result.implementation_status != 0)) return error.UnsupportedLoginResult;
+        if (out.len < wire_len) return error.BufferTooSmall;
 
         try (MessageHeader{
             .session_id = self.session_id,
@@ -523,14 +561,19 @@ pub const StatusAgent = struct {
         try (SubmessageHeader{
             .id = .status_agent,
             .flags = flag_little_endian,
-            .length = payload_len,
+            .length = @intCast(wire_len - 8),
         }).encode(out[4..8]);
 
-        @memcpy(out[8..12], &xrce_cookie);
-        @memcpy(out[12..14], &xrce_version);
-        @memcpy(out[14..16], &self.vendor_id);
-        out[16] = 0; // optional properties absent
-        return message_len;
+        if (result_len != 0) {
+            out[8] = @backingInt(self.result.status);
+            out[9] = self.result.implementation_status;
+        }
+        const start = 8 + result_len;
+        @memcpy(out[start..][0..4], &xrce_cookie);
+        @memcpy(out[start + 4 ..][0..2], &xrce_version);
+        @memcpy(out[start + 6 ..][0..2], &self.vendor_id);
+        out[start + 8] = 0; // optional properties absent
+        return wire_len;
     }
 };
 
@@ -538,32 +581,48 @@ pub const DecodedStatusAgent = struct {
     header: MessageHeader,
     submessage: SubmessageHeader,
     vendor_id: [2]u8,
+    /// Absent in the published OMG IDL; do not invent a wire status.
+    result: ?ResultStatus,
 };
 
 pub fn decodeStatusAgent(header: MessageHeader, submessage: Submessage) !DecodedStatusAgent {
+    return decodeStatusAgentWithEncoding(header, submessage, .omg_1_0);
+}
+
+pub fn decodeStatusAgentWithEncoding(header: MessageHeader, submessage: Submessage, encoding: HandshakeEncoding) !DecodedStatusAgent {
     const sh = submessage.header;
     if (sh.id != .status_agent) return error.UnexpectedSubmessage;
-    if (sh.length != StatusAgent.payload_len) return error.InvalidSubmessageLength;
+    const result_len: usize = if (encoding == .eprosima_v3) 2 else 0;
+    const expected_len = StatusAgent.payload_len + result_len;
+    if (sh.length != expected_len) return error.InvalidSubmessageLength;
     if ((sh.flags & flag_little_endian) == 0) return error.UnsupportedEndian;
 
     const payload = submessage.payload;
-    if (payload.len < StatusAgent.payload_len) return error.ShortSubmessage;
-    if (!std.mem.eql(u8, payload[0..4], &xrce_cookie)) return error.InvalidXrceCookie;
-    if (!std.mem.eql(u8, payload[4..6], &xrce_version)) return error.UnsupportedXrceVersion;
-    if (payload[8] != 0) return error.PropertiesNotSupported;
+    if (payload.len < expected_len) return error.ShortSubmessage;
+    if (!std.mem.eql(u8, payload[result_len..][0..4], &xrce_cookie)) return error.InvalidXrceCookie;
+    if (!std.mem.eql(u8, payload[result_len + 4 ..][0..2], &xrce_version)) return error.UnsupportedXrceVersion;
+    if (payload[result_len + 8] != 0) return error.PropertiesNotSupported;
 
     return .{
         .header = header,
         .submessage = sh,
-        .vendor_id = payload[6..8].*,
+        .vendor_id = payload[result_len + 6 ..][0..2].*,
+        .result = if (result_len != 0) ResultStatus{
+            .status = statusValueFromByte(payload[0]) orelse return error.UnknownStatusValue,
+            .implementation_status = payload[1],
+        } else null,
     };
 }
 
 pub fn decodeStatusAgentMessage(bytes: []const u8) !DecodedStatusAgent {
+    return decodeStatusAgentMessageWithEncoding(bytes, .omg_1_0);
+}
+
+pub fn decodeStatusAgentMessageWithEncoding(bytes: []const u8, encoding: HandshakeEncoding) !DecodedStatusAgent {
     const message = try decodeMessage(bytes);
     var iterator = message.submessages();
     const submessage = (try iterator.next()) orelse return error.ShortSubmessage;
-    return decodeStatusAgent(message.header, submessage);
+    return decodeStatusAgentWithEncoding(message.header, submessage, encoding);
 }
 
 fn submessageIdFromByte(value: u8) ?SubmessageId {
@@ -854,7 +913,7 @@ test "create client encode/decode" {
     try std.testing.expectEqual(@as(usize, CreateClient.message_len), n);
     try std.testing.expectEqualSlices(u8, &.{ 0x80, 0x00, 0x00, 0x00 }, buf[0..4]);
     try std.testing.expectEqual(@backingInt(SubmessageId.create_client), buf[4]);
-    try std.testing.expectEqual(flag_little_endian | flag_create_reuse | flag_create_replace, buf[5]);
+    try std.testing.expectEqual(flag_little_endian, buf[5]);
     try std.testing.expectEqual(@as(u16, CreateClient.payload_len), readU16Le(buf[6..8]));
 
     const got = try decodeCreateClientMessage(&buf);
@@ -978,4 +1037,84 @@ test "status agent encode/decode" {
     try std.testing.expectEqual(@as(u8, 0xdd), got.header.session_id);
     try std.testing.expectEqual(@as(u16, 1), got.header.sequence_nr);
     try std.testing.expectEqualSlices(u8, &vendor_id_zenzen, &got.vendor_id);
+}
+
+test "independent eProsima login and create wire fixtures" {
+    const login = @embedFile("fixtures/eprosima-create-client.bin");
+    const got = try decodeCreateClientMessageWithEncoding(login, .eprosima_v3);
+    try std.testing.expectEqualSlices(u8, &.{ 0x55, 0x66, 0x77, 0x88 }, &got.client_key);
+    var encoded: [CreateClient.max_message_len]u8 = undefined;
+    _ = try (CreateClient{
+        .client_key = got.client_key,
+        .session_id = got.session_id,
+        .vendor_id = got.vendor_id,
+        .mtu = 508,
+        .handshake_encoding = .eprosima_v3,
+    }).encodeMessage(&encoded);
+    // The SDK sets only endianness on CREATE_CLIENT; mode flags are not needed.
+    try std.testing.expectEqualSlices(u8, login, &encoded);
+    const status = try decodeStatusAgentMessageWithEncoding(@embedFile("fixtures/eprosima-status-agent.bin"), .eprosima_v3);
+    try std.testing.expectEqual(StatusValue.ok, status.result.?.status);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 15 }, &status.vendor_id);
+    const participant = try decodeCreateMessage(@embedFile("fixtures/eprosima-participant.bin"));
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0x11 }, &participant.object_id);
+    try std.testing.expectEqual(@as(?i16, 0), participant.participant_domain_id);
+    var out: [128]u8 = undefined;
+    const n = try (CreateByReference{
+        .session_id = participant.header.session_id,
+        .stream_id = participant.header.stream_id,
+        .sequence_nr = participant.header.sequence_nr,
+        .request_id = participant.request_id,
+        .object_prefix = participant.object_prefix,
+        .object_kind = participant.object_kind,
+        .reference = participant.reference,
+        .reuse = false,
+        .replace = true,
+    }).encodeMessage(&out);
+    try std.testing.expectEqualSlices(u8, @embedFile("fixtures/eprosima-participant.bin"), out[0..n]);
+    const topic = try decodeCreateMessage(@embedFile("fixtures/eprosima-topic.bin"));
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0x12 }, &topic.object_id);
+    try std.testing.expectEqualSlices(u8, &participant.object_id, &topic.related_object_id.?);
+}
+
+test "independent login fixtures reject truncation and failed session results" {
+    const login = @embedFile("fixtures/eprosima-create-client.bin");
+    try std.testing.expectError(error.TruncatedSubmessage, decodeCreateClientMessageWithEncoding(login[0 .. login.len - 1], .eprosima_v3));
+    const status = @embedFile("fixtures/eprosima-status-agent.bin");
+    try std.testing.expectError(error.TruncatedSubmessage, decodeStatusAgentMessageWithEncoding(status[0 .. status.len - 1], .eprosima_v3));
+    var bad: [status.len]u8 = status.*;
+    bad[8] = @backingInt(StatusValue.err_denied);
+    const decoded = try decodeStatusAgentMessageWithEncoding(&bad, .eprosima_v3);
+    try std.testing.expectEqual(StatusValue.err_denied, decoded.result.?.status);
+}
+
+test "published OMG login layouts are default and dialects are not autodetected" {
+    const omg_login = @embedFile("fixtures/omg-create-client.bin");
+    var out: [CreateClient.max_message_len]u8 = undefined;
+    const n = try (CreateClient{ .client_key = .{ 0x11, 0x22, 0x33, 0x44 }, .session_id = 0x81 }).encodeMessage(&out);
+    try std.testing.expectEqualSlices(u8, omg_login, out[0..n]);
+    const decoded = try decodeCreateClientMessage(omg_login);
+    try std.testing.expectEqual(@as(?u16, null), decoded.mtu);
+    const omg_status = @embedFile("fixtures/omg-status-agent.bin");
+    var reply: [StatusAgent.max_message_len]u8 = undefined;
+    const m = try (StatusAgent{ .session_id = 0x81 }).encodeMessage(&reply);
+    try std.testing.expectEqualSlices(u8, omg_status, reply[0..m]);
+    try std.testing.expectEqual(@as(?ResultStatus, null), (try decodeStatusAgentMessage(omg_status)).result);
+    try std.testing.expectError(error.UnsupportedLoginResult, (StatusAgent{
+        .session_id = 0x81,
+        .result = .{ .status = .err_denied },
+    }).encodeMessage(&reply));
+    try std.testing.expectError(error.InvalidSubmessageLength, decodeCreateClientMessage(@embedFile("fixtures/eprosima-create-client.bin")));
+    try std.testing.expectError(error.InvalidSubmessageLength, decodeStatusAgentMessage(@embedFile("fixtures/eprosima-status-agent.bin")));
+    try std.testing.expectError(error.InvalidSubmessageLength, decodeCreateClientMessageWithEncoding(omg_login, .eprosima_v3));
+    try std.testing.expectError(error.InvalidSubmessageLength, decodeStatusAgentMessageWithEncoding(omg_status, .eprosima_v3));
+}
+
+test "CREATE prefix is combined with ObjectKind and original request ID bytes retained" {
+    const fixture = @embedFile("fixtures/eprosima-participant.bin");
+    var prefix_request: [fixture.len]u8 = fixture.*;
+    prefix_request[11] = 0x10;
+    const decoded = try decodeCreateMessage(&prefix_request);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0x10 }, &decoded.request_object_id);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0x11 }, &decoded.object_id);
 }
