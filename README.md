@@ -29,3 +29,8 @@ app.addImport("zz0_client", client.module("zz0_client"));
 ```
 
 Application code can then use `@import("zz0_client")`.
+
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md) for current scope, interoperability goals and the
+planned path toward DDS bridging, reliable sessions and subscriptions.
