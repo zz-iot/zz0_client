@@ -123,6 +123,36 @@ pub const ClientSession = struct {
         try transport.send(bytes, endpoint);
     }
 
+    pub const CreateBinaryOptions = struct {
+        object_prefix: xrce.ObjectIdPrefix,
+        parent: xrce.ObjectId,
+        definition: xrce.BinaryCreate,
+        reuse: bool = true,
+        replace: bool = false,
+    };
+
+    pub fn encodeCreateBinary(self: *ClientSession, out: []u8, options: CreateBinaryOptions) ![]const u8 {
+        const request_id = self.takeRequestId();
+        const sequence_nr = self.takeSequenceNr();
+        const len = try (xrce.CreateBinary{
+            .session_id = self.session_id,
+            .stream_id = self.output_stream_id,
+            .sequence_nr = sequence_nr,
+            .request_id = request_id,
+            .object_prefix = options.object_prefix,
+            .parent = options.parent,
+            .definition = options.definition,
+            .reuse = options.reuse,
+            .replace = options.replace,
+        }).encodeMessage(out);
+        const kind: xrce.ObjectKind = switch (options.definition) {
+            .publisher => .publisher,
+            .datawriter => .datawriter,
+        };
+        self.pending_request = .{ .request_id = request_id, .object_id = xrce.objectIdFromPrefix(options.object_prefix, kind) };
+        return out[0..len];
+    }
+
     pub const WriteDataOptions = struct {
         object_id: xrce.ObjectId,
         serialized_data: []const u8,
