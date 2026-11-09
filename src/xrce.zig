@@ -13,6 +13,10 @@ pub const stream_id_none: u8 = 0x00;
 pub const stream_id_builtin_best_effort: u8 = 0x01;
 pub const stream_id_builtin_reliable: u8 = 0x80;
 
+/// Explicit project default; no implicit historical XTypes 1.2 decoding.
+pub const XcdrRevision = enum { xtypes_1_3 };
+pub const xcdr_revision: XcdrRevision = .xtypes_1_3;
+
 pub const flag_little_endian: u8 = 0x01;
 pub const flag_create_reuse: u8 = 0x02;
 pub const flag_create_replace: u8 = 0x04;
@@ -291,6 +295,89 @@ pub const CreateByReference = struct {
     }
 };
 
+pub const BinaryCreate = union(enum) { publisher: ?[]const u8, datawriter: []const u8 };
+pub const CreateRepresentation = union(RepresentationFormat) {
+    by_reference: []const u8,
+    as_xml_string: []const u8,
+    in_binary: BinaryCreate,
+};
+/// Modern XCDR2 subset with absent QoS and an explicit outer octet-sequence length.
+pub const CreateBinary = struct {
+    session_id: u8,
+    stream_id: u8 = stream_id_builtin_best_effort,
+    sequence_nr: u16,
+    request_id: RequestId,
+    object_prefix: ObjectIdPrefix,
+    parent: ObjectId,
+    definition: BinaryCreate,
+    reuse: bool = true,
+    replace: bool = false,
+    pub fn encodeMessage(self: CreateBinary, out: []u8) !usize {
+        if (out.len < 8) return error.BufferTooSmall;
+        const kind: ObjectKind = switch (self.definition) {
+            .publisher => .publisher,
+            .datawriter => .datawriter,
+        };
+        var w = PayloadWriter.init(out[8..]);
+        try w.writeBytes(&self.request_id);
+        try w.writeBytes(&objectIdFromPrefix(self.object_prefix, kind));
+        try w.writeU8(@backingInt(kind));
+        try w.writeU8(@backingInt(RepresentationFormat.in_binary));
+        try w.writeU32(0);
+        const body_start = w.pos;
+        try w.writeU32(0);
+        switch (self.definition) {
+            .publisher => |name| {
+                try w.writeU8(if (name != null) 1 else 0);
+                if (name) |value| {
+                    try binaryName(value, 128);
+                    try w.writeString(value);
+                }
+            },
+            .datawriter => |name| {
+                try binaryName(name, 256);
+                try w.writeString(name);
+            },
+        }
+        try w.writeU8(0); // QoS absent
+        writeU32Le(out[16..20], @intCast(w.pos - body_start));
+        writeU32Le(out[8 + body_start ..][0..4], @intCast(w.pos - body_start - 4));
+        try w.writeBytes(&self.parent);
+        try (MessageHeader{ .session_id = self.session_id, .stream_id = self.stream_id, .sequence_nr = self.sequence_nr }).encode(out[0..4]);
+        try (SubmessageHeader{ .id = .create, .flags = flag_little_endian | (if (self.reuse) flag_create_reuse else 0) | (if (self.replace) flag_create_replace else 0), .length = @intCast(w.pos) }).encode(out[4..8]);
+        return 8 + w.pos;
+    }
+};
+fn binaryName(name: []const u8, max: usize) !void {
+    if (name.len == 0 or name.len > max or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidBinaryName;
+}
+fn optionalPresent(r: *PayloadReader) !bool {
+    return switch (try r.readU8()) {
+        0 => false,
+        1 => true,
+        else => error.InvalidOptionalFlag,
+    };
+}
+fn decodeBinary(kind: ObjectKind, bytes: []const u8) !BinaryCreate {
+    if (kind != .publisher and kind != .datawriter) return error.UnsupportedObjectKind;
+    var r = PayloadReader.init(bytes);
+    const size = try r.readU32();
+    if (size & 0x80000000 != 0) return error.LegacyXcdr2Unsupported;
+    if (size != r.remaining()) return error.InvalidDelimitedLength;
+    const result: BinaryCreate = if (kind == .publisher) .{ .publisher = if (try optionalPresent(&r)) blk: {
+        const name = try r.readString();
+        try binaryName(name, 128);
+        break :blk name;
+    } else null } else blk: {
+        const name = try r.readString();
+        try binaryName(name, 256);
+        break :blk .{ .datawriter = name };
+    };
+    if (try optionalPresent(&r)) return error.BinaryQosUnsupported;
+    if (r.remaining() != 0) return error.UnsupportedBinaryFields;
+    return result;
+}
+
 pub const DecodedCreate = struct {
     /// Preserve the request bytes for reply correlation; CREATE also permits a prefix.
     request_object_id: ObjectId,
@@ -301,7 +388,9 @@ pub const DecodedCreate = struct {
     object_id: ObjectId,
     object_kind: ObjectKind,
     representation_format: RepresentationFormat,
+    /// Legacy convenience field: empty for binary representations.
     reference: []const u8,
+    representation: CreateRepresentation,
     participant_domain_id: ?i16 = null,
     related_object_id: ?ObjectId = null,
 };
@@ -317,11 +406,22 @@ pub fn decodeCreate(header: MessageHeader, submessage: Submessage) !DecodedCreat
     const object_prefix: ObjectIdPrefix = .{ wire_object_id[0], wire_object_id[1] & 0xf0 };
     const object_kind = objectKindFromByte(try reader.readU8()) orelse return error.UnknownObjectKind;
     const representation_format = representationFormatFromByte(try reader.readU8()) orelse return error.UnknownRepresentationFormat;
-    if (representation_format != .by_reference and !(object_kind == .publisher and representation_format == .as_xml_string)) return error.UnsupportedRepresentationFormat;
-    if (!objectKindSupportsReference(object_kind)) return error.UnsupportedObjectKind;
-
-    const reference = try reader.readString();
-    if (representation_format == .as_xml_string and reference.len != 0) return error.UnsupportedRepresentationFormat;
+    var reference: []const u8 = "";
+    const representation: CreateRepresentation = if (representation_format == .in_binary) blk: {
+        const size = try reader.readU32();
+        if (size > 1024) return error.BinaryRepresentationTooLong;
+        if (size > reader.remaining()) return error.EndOfStream;
+        const bytes = reader.data[reader.pos..][0..size];
+        reader.pos += size;
+        break :blk .{ .in_binary = try decodeBinary(object_kind, bytes) };
+    } else blk: {
+        if (representation_format != .by_reference and !(object_kind == .publisher and representation_format == .as_xml_string)) return error.UnsupportedRepresentationFormat;
+        if (!objectKindSupportsReference(object_kind)) return error.UnsupportedObjectKind;
+        reference = try reader.readString();
+        if (reference.len > 128) return error.ReferenceTooLong;
+        if (representation_format == .as_xml_string and reference.len != 0) return error.UnsupportedRepresentationFormat;
+        break :blk if (representation_format == .by_reference) .{ .by_reference = reference } else .{ .as_xml_string = reference };
+    };
     var participant_domain_id: ?i16 = null;
     var related_object_id: ?ObjectId = null;
 
@@ -344,6 +444,7 @@ pub fn decodeCreate(header: MessageHeader, submessage: Submessage) !DecodedCreat
         .object_kind = object_kind,
         .representation_format = representation_format,
         .reference = reference,
+        .representation = representation,
         .participant_domain_id = participant_domain_id,
         .related_object_id = related_object_id,
     };
@@ -434,6 +535,66 @@ pub const WriteData = struct {
         return message_len;
     }
 };
+
+/// DELETE's BaseObjectRequest carries an actual object ID, never a CREATE prefix.
+pub const DeleteRequest = struct {
+    session_id: u8,
+    stream_id: u8 = stream_id_builtin_best_effort,
+    sequence_nr: u16,
+    request_id: RequestId,
+    object_id: ObjectId,
+    pub const encoded_len = 12;
+    pub fn encodeMessage(self: DeleteRequest, out: []u8) !usize {
+        if (out.len < encoded_len) return error.BufferTooSmall;
+        try (MessageHeader{ .session_id = self.session_id, .stream_id = self.stream_id, .sequence_nr = self.sequence_nr }).encode(out[0..4]);
+        try (SubmessageHeader{ .id = .delete, .flags = flag_little_endian, .length = 4 }).encode(out[4..8]);
+        @memcpy(out[8..10], &self.request_id);
+        @memcpy(out[10..12], &self.object_id);
+        return encoded_len;
+    }
+};
+pub const DecodedDelete = struct {
+    header: MessageHeader,
+    submessage: SubmessageHeader,
+    request_id: RequestId,
+    object_id: ObjectId,
+};
+pub fn decodeDelete(header: MessageHeader, submessage: Submessage) !DecodedDelete {
+    if (submessage.header.id != .delete) return error.UnexpectedSubmessage;
+    if ((submessage.header.flags & flag_little_endian) == 0) return error.UnsupportedEndian;
+    if (submessage.header.flags & ~flag_little_endian != 0) return error.UnsupportedFlags;
+    if (submessage.payload.len != 4 or submessage.header.length != 4) return error.InvalidSubmessageLength;
+    return .{ .header = header, .submessage = submessage.header, .request_id = submessage.payload[0..2].*, .object_id = submessage.payload[2..4].* };
+}
+pub fn decodeDeleteMessage(bytes: []const u8) !DecodedDelete {
+    const message = try decodeMessage(bytes);
+    var iterator = message.submessages();
+    return decodeDelete(message.header, (try iterator.next()) orelse return error.ShortSubmessage);
+}
+pub const Reset = struct {
+    session_id: u8,
+    stream_id: u8 = stream_id_builtin_best_effort,
+    sequence_nr: u16,
+    pub const encoded_len = 8;
+    pub fn encodeMessage(self: Reset, out: []u8) !usize {
+        if (out.len < encoded_len) return error.BufferTooSmall;
+        try (MessageHeader{ .session_id = self.session_id, .stream_id = self.stream_id, .sequence_nr = self.sequence_nr }).encode(out[0..4]);
+        try (SubmessageHeader{ .id = .reset, .flags = flag_little_endian, .length = 0 }).encode(out[4..8]);
+        return encoded_len;
+    }
+};
+pub fn decodeReset(header: MessageHeader, submessage: Submessage) !MessageHeader {
+    if (submessage.header.id != .reset) return error.UnexpectedSubmessage;
+    if ((submessage.header.flags & flag_little_endian) == 0) return error.UnsupportedEndian;
+    if (submessage.header.flags & ~flag_little_endian != 0) return error.UnsupportedFlags;
+    if (submessage.payload.len != 0 or submessage.header.length != 0) return error.InvalidSubmessageLength;
+    return header;
+}
+pub fn decodeResetMessage(bytes: []const u8) !MessageHeader {
+    const message = try decodeMessage(bytes);
+    var iterator = message.submessages();
+    return decodeReset(message.header, (try iterator.next()) orelse return error.ShortSubmessage);
+}
 
 pub const DecodedWriteData = struct {
     header: MessageHeader,
@@ -1117,4 +1278,83 @@ test "CREATE prefix is combined with ObjectKind and original request ID bytes re
     const decoded = try decodeCreateMessage(&prefix_request);
     try std.testing.expectEqualSlices(u8, &.{ 0, 0x10 }, &decoded.request_object_id);
     try std.testing.expectEqualSlices(u8, &.{ 0, 0x11 }, &decoded.object_id);
+}
+
+// Hand-authored fixtures follow Annex A BaseObjectRequest and RESET_Payload;
+// neither fixture comes from the encoder being tested.
+test "DELETE and RESET codecs match independently authored wire bytes" {
+    const deletion = [_]u8{ 0x81, 0x01, 0x34, 0x12, 0x03, 0x01, 0x04, 0x00, 0xaa, 0x01, 0x00, 0x15 };
+    const reset = [_]u8{ 0x81, 0x01, 0x35, 0x12, 0x0c, 0x01, 0x00, 0x00 };
+    const decoded = try decodeDeleteMessage(&deletion);
+    try std.testing.expectEqualSlices(u8, &.{ 0xaa, 1 }, &decoded.request_id);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0x15 }, &decoded.object_id);
+    try std.testing.expectEqual(@as(u16, 0x1234), decoded.header.sequence_nr);
+    var out: [32]u8 = undefined;
+    const n = try (DeleteRequest{ .session_id = 0x81, .sequence_nr = 0x1234, .request_id = .{ 0xaa, 1 }, .object_id = .{ 0, 0x15 } }).encodeMessage(&out);
+    try std.testing.expectEqualSlices(u8, &deletion, out[0..n]);
+    const header = try decodeResetMessage(&reset);
+    try std.testing.expectEqual(@as(u8, 0x81), header.session_id);
+    const m = try (Reset{ .session_id = 0x81, .sequence_nr = 0x1235 }).encodeMessage(&out);
+    try std.testing.expectEqualSlices(u8, &reset, out[0..m]);
+}
+test "lifecycle codecs reject unsupported flags and non-exact payloads" {
+    const header: MessageHeader = .{ .session_id = 0x81, .stream_id = 1, .sequence_nr = 0 };
+    const deletion: Submessage = .{ .frame = &.{}, .header = .{ .id = .delete, .flags = 1, .length = 4 }, .payload = &.{ 0, 1, 0, 0x15 } };
+    var bad = deletion;
+    bad.header.flags = 3;
+    try std.testing.expectError(error.UnsupportedFlags, decodeDelete(header, bad));
+    bad = deletion;
+    bad.header.flags = 0;
+    try std.testing.expectError(error.UnsupportedEndian, decodeDelete(header, bad));
+    bad = deletion;
+    bad.payload = &.{ 0, 1, 0 };
+    try std.testing.expectError(error.InvalidSubmessageLength, decodeDelete(header, bad));
+    bad = deletion;
+    bad.payload = &.{ 0, 1, 0, 0x15, 0 };
+    try std.testing.expectError(error.InvalidSubmessageLength, decodeDelete(header, bad));
+    bad.header = .{ .id = .reset, .flags = 1, .length = 1 };
+    bad.payload = &.{0};
+    try std.testing.expectError(error.InvalidSubmessageLength, decodeReset(header, bad));
+    var out: [7]u8 = undefined;
+    try std.testing.expectError(error.BufferTooSmall, (Reset{ .session_id = 0x81, .sequence_nr = 0 }).encodeMessage(&out));
+    try std.testing.expectError(error.BufferTooSmall, (DeleteRequest{ .session_id = 0x81, .sequence_nr = 0, .request_id = .{ 0, 1 }, .object_id = .{ 0, 0x15 } }).encodeMessage(&out));
+}
+
+// Hand-authored from the IDL outer sequence and XTypes 1.3 appendable rules.
+const modern_publisher_fixture = [_]u8{ 0x81, 1, 0, 0, 1, 1, 20, 0, 0xaa, 1, 0, 0x13, 3, 3, 0, 0, 6, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0x11 };
+const modern_writer_fixture = [_]u8{ 0x81, 1, 0, 0, 1, 1, 30, 0, 0xaa, 2, 0, 0x15, 5, 3, 0, 0, 16, 0, 0, 0, 12, 0, 0, 0, 7, 0, 0, 0, 'S', 'q', 'u', 'a', 'r', 'e', 0, 0, 0, 0x13 };
+test "binary CREATE uses explicit modern XCDR2 and tagged representations" {
+    try std.testing.expectEqual(XcdrRevision.xtypes_1_3, xcdr_revision);
+    const pub_ = try decodeCreateMessage(&modern_publisher_fixture);
+    try std.testing.expect(pub_.representation.in_binary.publisher == null);
+    const writer = try decodeCreateMessage(&modern_writer_fixture);
+    try std.testing.expectEqualStrings("Square", writer.representation.in_binary.datawriter);
+    try std.testing.expectEqualStrings("", writer.reference);
+    var out: [256]u8 = undefined;
+    const n = try (CreateBinary{ .session_id = 0x81, .sequence_nr = 0, .request_id = .{ 0xaa, 1 }, .object_prefix = .{ 0, 0x10 }, .parent = .{ 0, 0x11 }, .definition = .{ .publisher = null }, .reuse = false }).encodeMessage(&out);
+    try std.testing.expectEqualSlices(u8, &modern_publisher_fixture, out[0..n]);
+    const m = try (CreateBinary{ .session_id = 0x81, .sequence_nr = 0, .request_id = .{ 0xaa, 2 }, .object_prefix = .{ 0, 0x10 }, .parent = .{ 0, 0x13 }, .definition = .{ .datawriter = "Square" }, .reuse = false }).encodeMessage(&out);
+    try std.testing.expectEqualSlices(u8, &modern_writer_fixture, out[0..m]);
+    const named = try (CreateBinary{ .session_id = 0x81, .sequence_nr = 0, .request_id = .{ 0, 3 }, .object_prefix = .{ 0, 0x20 }, .parent = .{ 0, 0x11 }, .definition = .{ .publisher = "Pub" } }).encodeMessage(&out);
+    try std.testing.expectEqualStrings("Pub", (try decodeCreateMessage(out[0..named])).representation.in_binary.publisher.?);
+}
+test "binary CREATE rejects historical delimiters malformed lengths and unsupported QoS" {
+    var bad = modern_writer_fixture;
+    bad[23] = 0x80;
+    try std.testing.expectError(error.LegacyXcdr2Unsupported, decodeCreateMessage(&bad));
+    bad = modern_writer_fixture;
+    bad[20] = 11;
+    try std.testing.expectError(error.InvalidDelimitedLength, decodeCreateMessage(&bad));
+    bad = modern_writer_fixture;
+    bad[16] = 0xff;
+    bad[17] = 0xff;
+    try std.testing.expectError(error.BinaryRepresentationTooLong, decodeCreateMessage(&bad));
+    bad = modern_writer_fixture;
+    bad[35] = 1;
+    try std.testing.expectError(error.BinaryQosUnsupported, decodeCreateMessage(&bad));
+    bad[35] = 2;
+    try std.testing.expectError(error.InvalidOptionalFlag, decodeCreateMessage(&bad));
+    for (0..modern_writer_fixture.len) |len| {
+        if (decodeCreateMessage(modern_writer_fixture[0..len])) |_| return error.ExpectedTruncationFailure else |_| {}
+    }
 }

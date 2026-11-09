@@ -52,3 +52,10 @@ defaults to best-effort 0x01; reliable streams remain unimplemented.
 See [spec-audit.md](spec-audit.md) for the clause-by-clause review and remaining
 gaps. The codec defaults to the published OMG login layout. This test explicitly
 selects `HandshakeEncoding.eprosima_v3` for the extra MTU/result fields.
+
+The Pico firmware uses a separate standard CREATE helper: participant/topic
+references, then modern XTypes 1.3 binary publisher/writer records. This pinned
+eProsima compatibility fixture deliberately retains its vendor CREATE forms.
+Its binary writer API instead takes a topic object ID and includes QoS; it is
+not a drop-in replacement for our topic-name binary subset. These fixtures do
+not require the firmware or real DDS backend to accept the vendor extensions.

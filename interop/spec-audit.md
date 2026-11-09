@@ -70,3 +70,10 @@ reflashed boards passed simultaneous publishing, decoded sample checks,
 agent-restart recovery and WiFi reconnect recovery with the updated agent.
 This is operator-reported hardware evidence. Remote CI has not been run.
 No conformance profile is inferred from these results.
+
+## Backend integration follow-up (2026-10-30)
+
+See the [binary CREATE audit](binary-create-audit.md) for the older XCDR2
+delimiter rules and IDL/example discrepancies found during backend integration.
+DELETE/RESET codecs now exist; they do not by themselves complete session cleanup
+or make the existing conformance gaps disappear.
