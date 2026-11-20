@@ -14,7 +14,7 @@ a STATUS response (§8.3.5.8); the pinned peer's behavior does not weaken that r
 NO_KEY: this test does not validate DDS keyed-instance semantics.
 
 On Linux, install CMake, a C/C++ compiler, OpenSSL development headers and
-`libfoonathan-memory-dev`, then run from this repository with Zig 0.17.0:
+`libfoonathan-memory-dev`, then run from this repository with Zig 0.17.1:
 
 ```sh
 python3 interop/build_peers.py --work /tmp/zz0-peers --agent

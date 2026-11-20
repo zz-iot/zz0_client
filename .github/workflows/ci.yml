@@ -19,7 +19,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: '0.17.0'
+          version: '0.17.1'
       - run: zig fmt --check build.zig src interop/client.zig
       - run: zig build test
       - run: zig build test -Doptimize=ReleaseSafe
@@ -30,7 +30,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: '0.17.0'
+          version: '0.17.1'
       - name: Install independent peer build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libfoonathan-memory-dev libssl-dev
       - uses: actions/cache@v4
